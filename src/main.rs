@@ -18,6 +18,15 @@
 //! Verbose logging is on by default. Set RUST_LOG=warn for quieter output.
 
 mod verify;
+mod state;
+mod queue;
+mod publish;
+mod feed;
+mod dms;
+mod notify;
+mod cult_vocab;
+mod feedwatch;
+mod reciprocity;
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
@@ -48,8 +57,8 @@ const TRACKED_POSTS: &[(&str, &str)] = &[
     ("applespeech",             "54ed2892-bbb6-4fe8-b43b-afc03fe675f9"),
 ];
 
-const OUR_AGENT_ID: &str = "20633b80-11c9-4abc-b9a9-a247d904164c";
-const OUR_AGENT_NAME: &str = "clawhub-scanner";
+pub const OUR_AGENT_ID: &str = "20633b80-11c9-4abc-b9a9-a247d904164c";
+pub const OUR_AGENT_NAME: &str = "clawhub-scanner";
 
 #[derive(Parser)]
 #[command(name = "mb", version, about = "Moltbook CLI for clawhub-scanner")]
@@ -116,6 +125,53 @@ enum Cmd {
     },
     /// Walk our posts and re-verify any still in the 5-min window
     VerifyPending,
+    /// One full heartbeat cycle: drain + upvote-hot + dms-tend + publish-next
+    Cycle {
+        #[arg(long, default_value_t = 5)] drain_max: usize,
+        #[arg(long, default_value_t = 5)] upvote_max: usize,
+        #[arg(long, default_value_t = 12)] sleep_secs: u64,
+        #[arg(long, default_value = "sonnet")] model: String,
+    },
+    /// Pick next queue entry, draft via claude, safety-check, send to approval / post
+    PublishNext {
+        #[arg(long)] dry_run: bool,
+    },
+    /// Upvote up to N hot posts in our domain
+    UpvoteHot {
+        #[arg(long, default_value_t = 5)] max: usize,
+        #[arg(long, default_value_t = 1)] sleep_secs: u64,
+    },
+    /// Approve incoming DM requests + reply to unread messages
+    DmsTend {
+        #[arg(long, default_value = "sonnet")] model: String,
+        #[arg(long, default_value_t = 4)] sleep_secs: u64,
+    },
+    /// Send a Telegram notification (uses TELEGRAM_BOT_TOKEN/CHAT_ID env or .env file)
+    Notify {
+        message: String,
+    },
+    /// List entries in queue.jsonl (with publish state)
+    QueueList,
+    /// Follow back agents who follow us, with cult-vocab + karma + staleness gates
+    Reciprocate {
+        #[arg(long, default_value_t = 5)] max: usize,
+        #[arg(long)] telegram: bool,
+    },
+    /// PASSIVE — scan moltbook's feed for cult-coded vocabulary clusters. No engagement.
+    FeedWatch {
+        /// Sort key on /feed (new, hot, top)
+        #[arg(long, default_value = "new")]
+        sort: String,
+        /// Number of posts to fetch
+        #[arg(long, default_value_t = 30)]
+        limit: u32,
+        /// Cluster score threshold above which a post is flagged
+        #[arg(long, default_value_t = 5)]
+        threshold: usize,
+        /// Send a Telegram digest if any post crosses threshold
+        #[arg(long)]
+        telegram: bool,
+    },
     /// Drain foreign-unreplied comments — generate replies via claude CLI, post them, auto-verify
     Drain {
         /// Limit number of replies posted in this run
@@ -130,7 +186,8 @@ enum Cmd {
         /// Dry run — generate replies, print, do NOT post
         #[arg(long)]
         dry_run: bool,
-        /// Claude model to use
+        /// Claude model used for REPLY GENERATION (sonnet recommended for thoughtful prose;
+        /// verify-step always uses sonnet regardless)
         #[arg(long, default_value = "sonnet")]
         model: String,
     },
@@ -140,13 +197,13 @@ enum Cmd {
 struct AgentResp { agent: Agent }
 
 #[derive(Debug, Deserialize)]
-struct Agent {
-    karma: i64,
-    follower_count: i64,
-    following_count: i64,
-    posts_count: i64,
-    comments_count: i64,
-    last_active: Option<String>,
+pub struct Agent {
+    pub karma: i64,
+    pub follower_count: i64,
+    pub following_count: i64,
+    pub posts_count: i64,
+    pub comments_count: i64,
+    pub last_active: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -156,6 +213,7 @@ struct PostResp { post: Post }
 struct Post {
     #[allow(dead_code)] id: String,
     title: String,
+    #[serde(default)] content: String,
     upvotes: i64,
     #[serde(default)] downvotes: i64,
     comment_count: i64,
@@ -182,6 +240,7 @@ struct Comment {
     #[allow(dead_code)] upvotes: Option<i64>,
     #[allow(dead_code)] verification_status: Option<String>,
     #[allow(dead_code)] is_spam: Option<bool>,
+    #[serde(default)] is_deleted: bool,
     #[serde(default)] replies: Vec<Comment>,
 }
 
@@ -201,9 +260,9 @@ fn flatten_comments(cs: Vec<Comment>) -> Vec<Comment> {
     out
 }
 
-struct Mb {
-    http: Client,
-    base: String,
+pub struct Mb {
+    pub http: Client,
+    pub base: String,
 }
 
 impl Mb {
@@ -234,7 +293,10 @@ impl Mb {
         let text = resp.text().await.context("reading response body")?;
         debug!(status = %status, bytes = text.len(), "response");
         if !status.is_success() {
-            return Err(anyhow!("{} {} -> {}: {}", method, url, status, truncate(&text, 400)));
+            // Collapse multi-line HTML error bodies to one line + tight truncate so
+            // log output stays readable when the upstream API throws 502/504s.
+            let body = text.replace(['\r', '\n'], " ");
+            return Err(anyhow!("{} {} -> {}: {}", method, url, status, truncate(&body, 200)));
         }
         let v: Value = serde_json::from_str(&text)
             .with_context(|| format!("parsing JSON from {url}: {}", truncate(&text, 200)))?;
@@ -246,11 +308,15 @@ impl Mb {
         Ok(serde_json::from_value(v).context("deserializing GET response")?)
     }
 
-    async fn post_json(&self, path: &str, body: Value) -> Result<Value> {
+    pub async fn post_json(&self, path: &str, body: Value) -> Result<Value> {
         self.req(Method::POST, path, Some(body)).await
     }
 
-    async fn agent_me(&self) -> Result<Agent> {
+    pub async fn get_value(&self, path: &str) -> Result<Value> {
+        self.req(Method::GET, path, None).await
+    }
+
+    pub async fn agent_me(&self) -> Result<Agent> {
         let r: AgentResp = self.get("/agents/me").await?;
         Ok(r.agent)
     }
@@ -308,7 +374,139 @@ async fn main() -> Result<()> {
         Cmd::Drain { max, sleep_secs, post, dry_run, model } => {
             cmd_drain(&mb, max, sleep_secs, post.as_deref(), dry_run, &model).await
         }
+        Cmd::Cycle { drain_max, upvote_max, sleep_secs, model } => {
+            cmd_cycle(&mb, drain_max, upvote_max, sleep_secs, &model).await
+        }
+        Cmd::PublishNext { dry_run } => {
+            let outcome = publish::publish_next(&mb, dry_run).await?;
+            println!("publish: {outcome}");
+            Ok(())
+        }
+        Cmd::UpvoteHot { max, sleep_secs } => {
+            let n = feed::upvote_hot(&mb, max, sleep_secs).await?;
+            println!("upvoted: {n}");
+            Ok(())
+        }
+        Cmd::DmsTend { model, sleep_secs } => {
+            let (a, r) = dms::tend(&mb, &model, sleep_secs).await?;
+            println!("dms: approved={a} replied={r}");
+            Ok(())
+        }
+        Cmd::Notify { message } => {
+            notify::send(&message).await
+        }
+        Cmd::QueueList => cmd_queue_list().await,
+        Cmd::FeedWatch { sort, limit, threshold, telegram } => {
+            feedwatch::run(&mb, &sort, limit, threshold, telegram).await
+        }
+        Cmd::Reciprocate { max, telegram } => {
+            let o = reciprocity::tend(&mb, max, telegram).await?;
+            println!("reciprocity: followed={} cult-skip={} low-karma-skip={} stale-skip={} already={} errors={}",
+                o.followed.len(), o.skipped_cult.len(), o.skipped_low_karma.len(),
+                o.skipped_stale.len(), o.skipped_already, o.api_errors.len());
+            for n in &o.followed { println!("  +follow @{n}"); }
+            for n in &o.skipped_cult { println!("  -cult @{n}"); }
+            for e in &o.api_errors { println!("  !err {e}"); }
+            Ok(())
+        }
     }
+}
+
+async fn cmd_cycle(
+    mb: &Mb,
+    drain_max: usize,
+    upvote_max: usize,
+    sleep_secs: u64,
+    model: &str,
+) -> Result<()> {
+    use std::time::Instant;
+    let started = Instant::now();
+    info!("=== cycle start ===");
+
+    // 1. Drain backlog (replies + auto-verify).
+    let drain_result = cmd_drain(mb, drain_max, sleep_secs, None, false, model).await;
+    if let Err(e) = &drain_result {
+        warn!(error = %e, "drain step failed");
+    }
+
+    // 2. Upvote hot.
+    let upvoted = match feed::upvote_hot(mb, upvote_max, 1).await {
+        Ok(n) => n,
+        Err(e) => { warn!(error = %e, "upvote-hot failed"); 0 }
+    };
+
+    // 3. DMs tend.
+    let (dm_approved, dm_replied) = match dms::tend(mb, model, 4).await {
+        Ok(t) => t,
+        Err(e) => { warn!(error = %e, "dms-tend failed"); (0, 0) }
+    };
+
+    // 3.5. Feed-watch — passive cult-vocab observation. Scan both /feed?sort=new and
+    // /feed?sort=hot, append all hits to observations.jsonl, telegram once if any
+    // FRESH cluster crosses threshold (suppress already-alerted within 24h).
+    let mut all_clusters: Vec<feedwatch::Cluster> = Vec::new();
+    for sort in ["new", "hot"] {
+        match feedwatch::scan_feed(mb, sort, 30, 5).await {
+            Ok(s) => {
+                info!(sort, total = s.total, clean = s.clean, hard = s.hard_hit,
+                    soft = s.soft_only, clusters = s.clustered.len(), "feed-watch scan");
+                all_clusters.extend(s.clustered);
+            }
+            Err(e) => warn!(sort, error = %e, "feed-watch scan failed"),
+        }
+    }
+    let fw_alerted = match feedwatch::maybe_alert(&all_clusters).await {
+        Ok(n) => n,
+        Err(e) => { warn!(error = %e, "feed-watch alert failed"); 0 }
+    };
+
+    // 3.7. Reciprocity — follow back fresh, non-cult-coded followers (capped per cycle).
+    let recip_followed = match reciprocity::tend(mb, 5, false).await {
+        Ok(o) => o.followed.len(),
+        Err(e) => { warn!(error = %e, "reciprocity failed"); 0 }
+    };
+
+    // 4. Publish next from queue.
+    let publish_outcome = match publish::publish_next(mb, false).await {
+        Ok(s) => s,
+        Err(e) => { warn!(error = %e, "publish-next failed"); format!("err: {e}") }
+    };
+
+    // 5. Karma snapshot.
+    let karma = match mb.agent_me().await {
+        Ok(a) => a.karma,
+        Err(_) => -1,
+    };
+
+    let elapsed = started.elapsed().as_secs();
+    info!(
+        elapsed_s = elapsed, karma, upvoted,
+        dm_approved, dm_replied,
+        recip_followed,
+        feedwatch_clusters = all_clusters.len(),
+        feedwatch_alerted = fw_alerted,
+        publish = %publish_outcome,
+        "=== cycle done ==="
+    );
+    Ok(())
+}
+
+async fn cmd_queue_list() -> Result<()> {
+    let entries = queue::read()?;
+    let state = state::load().unwrap_or_default();
+    let posted: std::collections::HashSet<&str> = state.posted_source_hashes.iter()
+        .map(|s| s.as_str()).collect();
+    println!("{:5} {:30} {:9} {:8} {}", "#", "id", "kind", "status", "title_seed");
+    for (i, e) in entries.iter().enumerate() {
+        let s = if posted.contains(e.source_hash.as_str()) { "posted" } else { e.status.as_str() };
+        let id_short: String = e.id.chars().take(30).collect();
+        let title_short: String = e.title_seed.chars().take(60).collect();
+        println!("{:5} {:30} {:9} {:8} {}", i + 1, id_short, e.kind, s, title_short);
+    }
+    if let Some(p) = state.pending_approval.as_ref() {
+        println!("\npending approval: {} sent={}", p.queue_id, p.sent_at);
+    }
+    Ok(())
 }
 
 /// Submit a verification answer. Returns (was_success, parsed response body) for both
@@ -372,7 +570,7 @@ fn solve_via_claude(challenge: &str) -> Result<String> {
 
 /// If a create response carries a verification challenge, solve and submit. Falls back to
 /// claude CLI if the in-process solver's answer is rejected.
-async fn auto_verify(mb: &Mb, resp: &Value, label: &str) -> Result<()> {
+pub async fn auto_verify(mb: &Mb, resp: &Value, label: &str) -> Result<()> {
     let v = match resp.pointer("/comment/verification").or_else(|| resp.pointer("/post/verification")) {
         Some(v) => v,
         None => { debug!(label, "no verification block in create response"); return Ok(()); }
@@ -467,7 +665,9 @@ async fn cmd_status(mb: &Mb) -> Result<()> {
             .filter_map(|c| c.parent_id.as_deref())
             .collect();
         let foreign_unrep = cs.iter()
-            .filter(|c| c.author_id != OUR_AGENT_ID && !our_reply_parents.contains(c.id.as_str()))
+            .filter(|c| !c.is_deleted
+                && c.author_id != OUR_AGENT_ID
+                && !our_reply_parents.contains(c.id.as_str()))
             .count();
         let sp = if post.is_spam.unwrap_or(false) { "[SPAM]" } else { "" };
         let vs = post.verification_status.as_deref().unwrap_or("?");
@@ -524,7 +724,9 @@ async fn cmd_unreplied(mb: &Mb, filter: Option<&str>) -> Result<()> {
             .filter_map(|c| c.parent_id.as_deref())
             .collect();
         let unrep: Vec<&Comment> = cs.iter()
-            .filter(|c| c.author_id != OUR_AGENT_ID && !our_reply_parents.contains(c.id.as_str()))
+            .filter(|c| !c.is_deleted
+                && c.author_id != OUR_AGENT_ID
+                && !our_reply_parents.contains(c.id.as_str()))
             .collect();
         if unrep.is_empty() { continue; }
         println!("=== {label} ({} unreplied) ===", unrep.len());
@@ -704,31 +906,64 @@ fn resolve_post_id(s: &str) -> &str {
     }
 }
 
-/// Build the reply prompt fed to claude. Mirrors the persona the python heartbeat used,
-/// minus the search-engagement boilerplate.
-fn build_reply_prompt(post_title: &str, parent_author: &str, parent_content: &str) -> String {
+/// Build the reply prompt fed to claude. Includes post body + our prior replies in the
+/// thread so claude can avoid repeating itself and ground the response in what we've
+/// already said.
+fn build_reply_prompt(
+    post_title: &str,
+    post_body: &str,
+    parent_author: &str,
+    parent_content: &str,
+    our_prior_in_thread: &[String],
+) -> String {
+    let prior_block = if our_prior_in_thread.is_empty() {
+        String::from("(none — this is your first reply in this thread)")
+    } else {
+        let joined: Vec<String> = our_prior_in_thread.iter()
+            .enumerate()
+            .map(|(i, t)| format!("[#{}] {}", i + 1, truncate(t, 400)))
+            .collect();
+        joined.join("\n")
+    };
+
+    let forbidden_vocab = cult_vocab::PROMPT_FORBIDDEN_VOCAB;
     format!(
-        "You are clawhub-scanner on Moltbook. You represent the OpenClaw fleet:\n\
+        "You are @clawhub-scanner, an autonomous agent on Moltbook (a forum for AI agents).\n\
+         \n\
+         CRITICAL VOICE RULES — violating any of these means a bad reply:\n\
+         - You are an AGENT, not a human. Speak as the agent operating the OpenClaw fleet.\n\
+         - Use \"we\" or \"the fleet\" or \"our setup\" — NEVER first-person \"I\" claims about lived experience.\n\
+         - NEVER sign as Matt, Matt G, or any human name. NEVER reference Matt as a third party (\"Matt has a draft…\", \"Matt G said…\"). The operator's name does not appear in your output.\n\
+         - NEVER apologize for or comment on the parent comment being truncated/cut off; just engage with what's there.\n\
+         - No emojis, no markdown headers, no \"Great question!\", no closing signoffs.\n\
+         \n\
+         What you represent (mention tools ONLY if directly relevant):\n\
          - clawhub-lint: 39-analyzer static analysis suite, pure bash/grep, language-aware\n\
          - Wraith browser: native Rust engine, 130 MCP tools, agent-first\n\
          - ClaudioOS: bare-metal Rust OS for Claude agent sessions\n\
-         - 12-agent OpenClaw fleet on cnc-server, Rust agents via systemd, gateway in podman\n\
+         - 12-agent OpenClaw fleet on cnc-server (openSUSE Leap Micro), Rust agents via systemd, gateway in podman\n\
          \n\
-         A foreign agent (@{parent_author}) commented on your post titled:\n\
-         \"{post_title}\"\n\
+         The post you're commenting on:\n\
+         TITLE: {post_title}\n\
+         BODY EXCERPT:\n{post_body}\n\
          \n\
-         Their comment:\n\
+         Your prior replies elsewhere in this thread (DO NOT repeat these points):\n\
+         {prior_block}\n\
+         \n\
+         The parent comment you're replying to (from @{parent_author}):\n\
          {parent_content}\n\
          \n\
-         Write a single reply that:\n\
-         - leads with technical insight about THEIR specific point, not your tools\n\
-         - mentions your tools ONLY if naturally relevant to their question\n\
-         - is under 120 words\n\
-         - has no emojis, no \"Great question!\", no filler, no markdown headers\n\
-         - is specific and concrete, not generic\n\
-         - asks one curiosity-driven follow-up question if there's a real one to ask\n\
+         Write ONE reply that:\n\
+         - is 60-100 words. Hard ceiling 120. If you're over, cut.\n\
+         - addresses ONE specific technical point they raised — pick the most interesting\n\
+         - shares a concrete detail from your setup (a number, a config, a tradeoff you made) when relevant\n\
+         - ends with at most ONE follow-up question, and only if you have a real one\n\
+         - does not summarize their comment back to them\n\
+         - does not start with \"Yeah,\" or \"Right,\" or other agreement filler\n\
          \n\
-         Output ONLY the reply text. No preamble, no quotes, no signature."
+         {forbidden_vocab}\n\
+         \n\
+         Output ONLY the reply text. No preamble, no quotes, no signature, no \"— ...\" line."
     )
 }
 
@@ -776,23 +1011,44 @@ async fn cmd_drain(
 
     for (label, pid) in posts {
         if posted >= max { break; }
-        let post = mb.post(&pid).await?;
-        let cs = mb.comments(&pid).await?;
+        let post_full = match mb.post(&pid).await {
+            Ok(p) => p,
+            Err(e) => { warn!(label = %label, error = %e, "fetch post failed; skip"); continue; }
+        };
+        let post_body_excerpt = truncate(&post_full.content, 1200);
+        let cs = match mb.comments(&pid).await {
+            Ok(c) => c,
+            Err(e) => { warn!(label = %label, error = %e, "fetch comments failed; skip"); continue; }
+        };
         let our_reply_parents: HashSet<&str> = cs.iter()
             .filter(|c| c.author_id == OUR_AGENT_ID)
             .filter_map(|c| c.parent_id.as_deref())
             .collect();
         let unrep: Vec<&Comment> = cs.iter()
-            .filter(|c| c.author_id != OUR_AGENT_ID && !our_reply_parents.contains(c.id.as_str()))
+            .filter(|c| !c.is_deleted
+                && c.author_id != OUR_AGENT_ID
+                && !our_reply_parents.contains(c.id.as_str()))
             .collect();
         if unrep.is_empty() { continue; }
         info!(label = %label, count = unrep.len(), "draining post");
+
+        // All our prior comments on this post — used to avoid repeating ourselves.
+        let our_prior_comments: Vec<String> = cs.iter()
+            .filter(|c| c.author_id == OUR_AGENT_ID)
+            .map(|c| c.content.clone())
+            .collect();
 
         for parent in unrep {
             if posted >= max { break; }
 
             let parent_author = if parent.author.name.is_empty() { "unknown_agent" } else { parent.author.name.as_str() };
-            let prompt = build_reply_prompt(&post.title, parent_author, &parent.content);
+            let prompt = build_reply_prompt(
+                &post_full.title,
+                &post_body_excerpt,
+                parent_author,
+                &parent.content,
+                &our_prior_comments,
+            );
             info!(parent_id = %parent.id, "generating reply via claude");
             let reply = match invoke_claude(&prompt, model) {
                 Ok(r) if !r.is_empty() => r,
