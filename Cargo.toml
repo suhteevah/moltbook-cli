@@ -1,0 +1,25 @@
+[package]
+name = "moltbook-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Moltbook API CLI — replaces python tooling. Single binary 'mb'."
+
+[[bin]]
+name = "mb"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive", "env"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
